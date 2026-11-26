@@ -1,8 +1,10 @@
-# Southwind Labs role-aware hybrid RAG (Option B: remote HF Inference + Groq)
+# Southwind Labs role-aware hybrid RAG: install everything once
 # Python 3.10, 3.11 or 3.12 recommended.
 
-# --- Lightweight tokenizer & numerical helper ---
-tokenizers>=0.20
+# --- Embeddings, reranking, tokenizer (local models) ---
+torch>=2.2
+transformers>=4.40
+sentence-transformers>=3.0
 numpy>=1.26
 
 # --- Vector store and lexical search ---

@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import pickle
@@ -36,7 +35,6 @@ class PipelineConfig:
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2").strip()
     cross_encoder_model: str = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2").strip()
     tokenizer_name: str = os.getenv("TOKENIZER_NAME", "sentence-transformers/all-MiniLM-L6-v2").strip()
-    hf_inference_base: str = os.getenv("HF_INFERENCE_BASE", "https://router.huggingface.co/hf-inference/models").rstrip("/")
     qdrant_collection: str = os.getenv("QDRANT_COLLECTION", "").strip()
     candidate_k: int = 8
     top_pool: int = 4
@@ -47,132 +45,15 @@ class PipelineConfig:
     max_generation_tokens: int = MAX_GENERATION_TOKENS
 
 
-def _get_hf_token() -> str:
-    token = (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or "").strip()
-    if not token:
-        raise RuntimeError("HF_TOKEN is missing in environment / Render Environment Variables.")
-    return token
-
-
-def _hf_post_json(model_id: str, payload: dict[str, Any], timeout: int = 30) -> Any:
-    token = _get_hf_token()
-    url = f"{CONFIG.hf_inference_base}/{model_id}"
-    last_err: Exception | None = None
-
-    for attempt in range(3):
-        req = urlrequest.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-                "User-Agent": "Southwind-Hybrid-RAG/1.0",
-            },
-            method="POST",
-        )
-        try:
-            with urlrequest.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except error.HTTPError as exc:
-            err_body = exc.read().decode("utf-8", errors="replace")
-            if exc.code == 503 and attempt < 2:
-                time.sleep(2.0 * (attempt + 1))
-                last_err = RuntimeError(f"HF Inference 503 loading model '{model_id}': {err_body}")
-                continue
-            last_err = RuntimeError(f"HF Inference HTTP {exc.code} for '{model_id}': {err_body}")
-            raise last_err from exc
-        except Exception as exc:
-            last_err = exc
-            if attempt < 2:
-                time.sleep(1.0)
-                continue
-            raise
-
-    raise RuntimeError(f"HF Inference failed for '{model_id}': {last_err}")
-
-
-def _mean_pool_and_normalize(raw_vec: Any) -> list[float]:
-    if isinstance(raw_vec, list) and raw_vec and isinstance(raw_vec[0], list):
-        dim = len(raw_vec[0])
-        pooled = [0.0] * dim
-        count = 0
-        for row in raw_vec:
-            if isinstance(row, list) and len(row) == dim:
-                for i, val in enumerate(row):
-                    pooled[i] += float(val)
-                count += 1
-        vec = [v / max(count, 1) for v in pooled]
-    elif isinstance(raw_vec, list):
-        vec = [float(v) for v in raw_vec]
-    else:
-        raise RuntimeError(f"Unexpected embedding response shape: {type(raw_vec)}")
-
-    norm = math.sqrt(sum(x * x for x in vec))
-    if norm > 0:
-        vec = [x / norm for x in vec]
-    return vec
-
-
-def embed_query_remote(text: str) -> list[float]:
-    data = _hf_post_json(
-        CONFIG.embedding_model,
-        {"inputs": text, "options": {"wait_for_model": True}},
-    )
-    if (
-        isinstance(data, list)
-        and data
-        and isinstance(data[0], list)
-        and (not data[0] or not isinstance(data[0][0], list))
-        and len(data) == 1
-        and len(data[0]) > 16
-    ):
-        return _mean_pool_and_normalize(data[0])
-    return _mean_pool_and_normalize(data)
-
-
-def rerank_pairs_remote(query: str, passages: list[str]) -> list[float]:
-    if not passages:
-        return []
-
-    pairs = [[query, p[:1500]] for p in passages]
-    try:
-        data = _hf_post_json(
-            CONFIG.cross_encoder_model,
-            {"inputs": pairs, "options": {"wait_for_model": True}},
-        )
-        scores: list[float] = []
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, (int, float)):
-                    scores.append(float(item))
-                elif isinstance(item, list) and item:
-                    best = max(item, key=lambda x: float(x.get("score", 0.0)) if isinstance(x, dict) else 0.0)
-                    scores.append(float(best.get("score", 0.0)) if isinstance(best, dict) else float(best))
-                elif isinstance(item, dict) and "score" in item:
-                    scores.append(float(item["score"]))
-        if len(scores) == len(passages):
-            return scores
-    except Exception:
-        pass
-
-    # Fallback lexical overlap + position prior if remote cross-encoder returns non-matching shape/status
-    q_terms = {w.lower() for w in re.findall(r"\w{2,}", query)}
-    fallback_scores: list[float] = []
-    for idx, p in enumerate(passages):
-        p_terms = {w.lower() for w in re.findall(r"\w{2,}", p)}
-        overlap = len(q_terms & p_terms)
-        pos_prior = max(0.0, 1.0 - (idx * 0.1))
-        fallback_scores.append(round(overlap * 1.5 + pos_prior, 4))
-    return fallback_scores
-
-
 class _RuntimeAssets:
-    """Lightweight singleton container for indexes, tokenizer, and Qdrant/BM25 stores."""
+    """Lazy singleton container for indexes, embeddings, reranker, and tokenizer."""
 
     def __init__(self, cfg: PipelineConfig) -> None:
         self.cfg = cfg
         self._loaded = False
         self.tokenizer: Any = None
+        self.dense_encoder: Any = None
+        self.cross_encoder: Any = None
         self.qdrant_client: Any = None
         self.collection_name: str | None = None
         self.bm25_payload: Any = None
@@ -182,14 +63,15 @@ class _RuntimeAssets:
         if self._loaded:
             return
 
+        from transformers import AutoTokenizer
+        from sentence_transformers import CrossEncoder, SentenceTransformer
         from qdrant_client import QdrantClient
 
-        try:
-            from tokenizers import Tokenizer
-            self.tokenizer = Tokenizer.from_pretrained(self.cfg.tokenizer_name)
-        except Exception:
-            self.tokenizer = None
+        self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer_name)
+        self.dense_encoder = SentenceTransformer(self.cfg.embedding_model)
+        self.cross_encoder = CrossEncoder(self.cfg.cross_encoder_model)
 
+        # Locate local Qdrant storage directory if present
         qdrant_candidates = [
             p for p in self.cfg.base_dir.iterdir()
             if p.is_dir() and ("qdrant" in p.name.lower() or (p / "meta.json").exists())
@@ -202,6 +84,7 @@ class _RuntimeAssets:
             elif cols:
                 self.collection_name = cols[0]
 
+        # Locate BM25 index pickle if present
         bm25_candidates = list(self.cfg.base_dir.glob("*bm25*.pkl")) + list(self.cfg.base_dir.glob("*.pkl"))
         seen_pkl: set[Path] = set()
         for pkl_path in bm25_candidates:
@@ -232,9 +115,7 @@ def count_tokens(text: str) -> int:
     ASSETS.ensure_loaded()
     if not text:
         return 0
-    if ASSETS.tokenizer is not None:
-        return len(ASSETS.tokenizer.encode(text).ids)
-    return max(1, (len(text) + 3) // 4)
+    return len(ASSETS.tokenizer.encode(text, add_special_tokens=False))
 
 
 def _role_allowed(doc_role: str | None, user_role: str) -> bool:
@@ -275,9 +156,9 @@ def hybrid_search(query: str, role: str, top_k: int = 8, candidate_k: int = 8) -
     records_by_id: dict[str, dict[str, Any]] = {}
     rrf_k = 60.0
 
-    # 1. Dense Qdrant search via remote HF embedding
+    # 1. Dense Qdrant search
     if ASSETS.qdrant_client is not None and ASSETS.collection_name:
-        q_vec = embed_query_remote(query)
+        q_vec = ASSETS.dense_encoder.encode(query, normalize_embeddings=True).tolist()
         search_res = ASSETS.qdrant_client.query_points(
             collection_name=ASSETS.collection_name,
             query=q_vec,
@@ -382,10 +263,8 @@ def _fit_text_to_token_budget(text: str, query: str, token_budget: int) -> str:
         cand = compress_chunk_text(text, query=query, max_sentences=n_sent)
         if cand and count_tokens(cand) <= token_budget:
             return cand
-    if ASSETS.tokenizer is not None:
-        token_ids = ASSETS.tokenizer.encode(text).ids[:token_budget]
-        return ASSETS.tokenizer.decode(token_ids, skip_special_tokens=True).strip()
-    return text[: token_budget * 4].strip()
+    token_ids = ASSETS.tokenizer.encode(text, add_special_tokens=False)[:token_budget]
+    return ASSETS.tokenizer.decode(token_ids, skip_special_tokens=True).strip()
 
 
 def build_adaptive_context(
@@ -405,7 +284,8 @@ def build_adaptive_context(
 
     rescored: list[dict[str, Any]] = []
     if deduped:
-        ce_scores = rerank_pairs_remote(query, [h["text"] for h in deduped])
+        pairs = [(query, h["text"]) for h in deduped]
+        ce_scores = ASSETS.cross_encoder.predict(pairs)
         for h, score in zip(deduped, ce_scores):
             item = dict(h)
             item["ce_score"] = float(score)
@@ -610,7 +490,9 @@ def run_rag_query(
     deduped = deduplicate_hits(raw_hits)
     rescored: list[dict[str, Any]] = []
     if deduped:
-        ce_scores = rerank_pairs_remote(query, [h["text"] for h in deduped])
+        ASSETS.ensure_loaded()
+        pairs = [(query, h["text"]) for h in deduped]
+        ce_scores = ASSETS.cross_encoder.predict(pairs)
         for h, score in zip(deduped, ce_scores):
             item = dict(h)
             item["ce_score"] = float(score)
