@@ -1,21 +1,8 @@
-# Southwind Labs role-aware hybrid RAG: install everything once
+# Southwind Labs role-aware hybrid RAG (Option B: remote HF Inference + Groq)
 # Python 3.10, 3.11 or 3.12 recommended.
-#
-#   python -m venv .venv
-#   source .venv/bin/activate            (Windows: .venv\Scripts\activate)
-#   pip install --upgrade pip
-#   pip install -r requirements.txt
-#   python setup_models.py               (downloads both local models once)
-#
-# Names were checked against PyPI on 25 Nov 2026. Lower bounds only, so pip
-# picks current versions. Tell the assistant any version error you hit.
-# Optional CPU-only torch (smaller download):
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-# --- Embeddings, reranking, tokenizer (local models) ---
-torch>=2.2
-transformers>=4.40
-sentence-transformers>=3.0
+# --- Lightweight tokenizer & numerical helper ---
+tokenizers>=0.20
 numpy>=1.26
 
 # --- Vector store and lexical search ---
