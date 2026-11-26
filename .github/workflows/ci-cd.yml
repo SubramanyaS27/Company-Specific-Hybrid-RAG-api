@@ -1,0 +1,38 @@
+name: CI/CD — Build & Deploy to Render
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  verify-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax & RBAC Metadata Sanity Check
+        run: |
+          python -m py_compile rag_pipeline.py api.py
+          python -c "import json; chunks=json.load(open('chunks.json', encoding='utf-8')); assert len(chunks) > 0; print('Verified chunks:', len(chunks))"
+
+      - name: Build Docker Image (Smoke Test)
+        run: docker build -t company-hybrid-rag-api:ci .
+
+      - name: Trigger Render Deploy Hook
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -n "$RENDER_DEPLOY_HOOK_URL" ]; then
+            curl -fsSL -X POST "$RENDER_DEPLOY_HOOK_URL"
+          else
+            echo "RENDER_DEPLOY_HOOK_URL not set; skipping webhook trigger."
+          fi

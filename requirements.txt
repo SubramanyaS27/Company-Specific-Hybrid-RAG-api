@@ -1,0 +1,49 @@
+# Southwind Labs role-aware hybrid RAG: install everything once
+# Python 3.10, 3.11 or 3.12 recommended.
+#
+#   python -m venv .venv
+#   source .venv/bin/activate            (Windows: .venv\Scripts\activate)
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
+#   python setup_models.py               (downloads both local models once)
+#
+# Names were checked against PyPI on 25 Nov 2026. Lower bounds only, so pip
+# picks current versions. Tell the assistant any version error you hit.
+# Optional CPU-only torch (smaller download):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# --- Embeddings, reranking, tokenizer (local models) ---
+torch>=2.2
+transformers>=4.40
+sentence-transformers>=3.0
+numpy>=1.26
+
+# --- Vector store and lexical search ---
+qdrant-client>=1.10
+rank-bm25>=0.2.2
+
+# --- Orchestration (LangGraph) ---
+langgraph>=1.0
+langchain-core>=1.0
+
+# --- LLM generation (Groq free tier) and retries ---
+groq>=0.9
+tenacity>=8.2
+
+# --- Backend API ---
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.5
+python-dotenv>=1.0
+slowapi>=0.1.9
+httpx>=0.27
+
+# --- Observability and tracing (optional but recommended) ---
+langfuse>=3.0
+
+# --- MCP tool exposure (optional) ---
+mcp>=1.0
+
+# --- Evals and tests ---
+pandas>=2.0
+pytest>=8.0
