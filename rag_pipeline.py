@@ -16,10 +16,10 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-MAX_CONTEXT_TOKENS = 12000
-MAX_FRAMING_TOKENS = 1000
-MAX_GENERATION_TOKENS = 3000
-MAX_TOTAL_TOKENS = MAX_CONTEXT_TOKENS + MAX_FRAMING_TOKENS + MAX_GENERATION_TOKENS  # 16000
+MAX_CONTEXT_TOKENS = 650
+MAX_FRAMING_TOKENS = 250
+MAX_GENERATION_TOKENS = 500
+MAX_TOTAL_TOKENS = MAX_CONTEXT_TOKENS + MAX_FRAMING_TOKENS + MAX_GENERATION_TOKENS  # 1400 < 1500
 
 VALID_ROLES = {"employee", "manager", "admin"}
 ROLE_RANK = {"employee": 1, "manager": 2, "admin": 3}
@@ -33,7 +33,7 @@ class PipelineConfig:
     groq_api_url: str = "https://api.groq.com/openai/v1/chat/completions"
     groq_model: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2").strip()
-    cross_encoder_model: str = os.getenv("CROSS_ENCODER_MODEL", "Xenova/ms-marco-MiniLM-L-6-v2").strip()
+    cross_encoder_model: str = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2").strip()
     tokenizer_name: str = os.getenv("TOKENIZER_NAME", "sentence-transformers/all-MiniLM-L6-v2").strip()
     qdrant_collection: str = os.getenv("QDRANT_COLLECTION", "").strip()
     candidate_k: int = 8
@@ -46,7 +46,7 @@ class PipelineConfig:
 
 
 class _RuntimeAssets:
-    """Lazy singleton container for Qdrant, BM25, FastEmbed ONNX models, and tokenizer."""
+    """Lazy singleton container for indexes, embeddings, reranker, and tokenizer."""
 
     def __init__(self, cfg: PipelineConfig) -> None:
         self.cfg = cfg
@@ -63,15 +63,15 @@ class _RuntimeAssets:
         if self._loaded:
             return
 
-        from tokenizers import Tokenizer
-        from fastembed import TextEmbedding
-        from fastembed.rerank.cross_encoder import TextCrossEncoder
+        from transformers import AutoTokenizer
+        from sentence_transformers import CrossEncoder, SentenceTransformer
         from qdrant_client import QdrantClient
 
-        self.tokenizer = Tokenizer.from_pretrained(self.cfg.tokenizer_name)
-        self.dense_encoder = TextEmbedding(model_name=self.cfg.embedding_model)
-        self.cross_encoder = TextCrossEncoder(model_name=self.cfg.cross_encoder_model)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer_name)
+        self.dense_encoder = SentenceTransformer(self.cfg.embedding_model)
+        self.cross_encoder = CrossEncoder(self.cfg.cross_encoder_model)
 
+        # Locate local Qdrant storage directory if present
         qdrant_candidates = [
             p for p in self.cfg.base_dir.iterdir()
             if p.is_dir() and ("qdrant" in p.name.lower() or (p / "meta.json").exists())
@@ -84,6 +84,7 @@ class _RuntimeAssets:
             elif cols:
                 self.collection_name = cols[0]
 
+        # Locate BM25 index pickle if present
         bm25_candidates = list(self.cfg.base_dir.glob("*bm25*.pkl")) + list(self.cfg.base_dir.glob("*.pkl"))
         seen_pkl: set[Path] = set()
         for pkl_path in bm25_candidates:
@@ -114,7 +115,7 @@ def count_tokens(text: str) -> int:
     ASSETS.ensure_loaded()
     if not text:
         return 0
-    return len(ASSETS.tokenizer.encode(text, add_special_tokens=False).ids)
+    return len(ASSETS.tokenizer.encode(text, add_special_tokens=False))
 
 
 def _role_allowed(doc_role: str | None, user_role: str) -> bool:
@@ -155,10 +156,9 @@ def hybrid_search(query: str, role: str, top_k: int = 8, candidate_k: int = 8) -
     records_by_id: dict[str, dict[str, Any]] = {}
     rrf_k = 60.0
 
-    # 1. Dense Qdrant search via FastEmbed ONNX
+    # 1. Dense Qdrant search
     if ASSETS.qdrant_client is not None and ASSETS.collection_name:
-        q_vec_arr = next(ASSETS.dense_encoder.embed([query]))
-        q_vec = q_vec_arr.tolist() if hasattr(q_vec_arr, "tolist") else list(q_vec_arr)
+        q_vec = ASSETS.dense_encoder.encode(query, normalize_embeddings=True).tolist()
         search_res = ASSETS.qdrant_client.query_points(
             collection_name=ASSETS.collection_name,
             query=q_vec,
@@ -263,7 +263,7 @@ def _fit_text_to_token_budget(text: str, query: str, token_budget: int) -> str:
         cand = compress_chunk_text(text, query=query, max_sentences=n_sent)
         if cand and count_tokens(cand) <= token_budget:
             return cand
-    token_ids = ASSETS.tokenizer.encode(text, add_special_tokens=False).ids[:token_budget]
+    token_ids = ASSETS.tokenizer.encode(text, add_special_tokens=False)[:token_budget]
     return ASSETS.tokenizer.decode(token_ids, skip_special_tokens=True).strip()
 
 
@@ -284,7 +284,8 @@ def build_adaptive_context(
 
     rescored: list[dict[str, Any]] = []
     if deduped:
-        ce_scores = list(ASSETS.cross_encoder.rerank(query, [h["text"] for h in deduped]))
+        pairs = [(query, h["text"]) for h in deduped]
+        ce_scores = ASSETS.cross_encoder.predict(pairs)
         for h, score in zip(deduped, ce_scores):
             item = dict(h)
             item["ce_score"] = float(score)
@@ -490,7 +491,8 @@ def run_rag_query(
     rescored: list[dict[str, Any]] = []
     if deduped:
         ASSETS.ensure_loaded()
-        ce_scores = list(ASSETS.cross_encoder.rerank(query, [h["text"] for h in deduped]))
+        pairs = [(query, h["text"]) for h in deduped]
+        ce_scores = ASSETS.cross_encoder.predict(pairs)
         for h, score in zip(deduped, ce_scores):
             item = dict(h)
             item["ce_score"] = float(score)
@@ -573,3 +575,14 @@ def run_rag_query(
             ROLE_SCOPED_CACHE[fast_key] = dict(result)
 
     return result
+
+
+if __name__ == "__main__":
+    sample = run_rag_query(
+        "What are the rules for leave approval and laptop security?",
+        role="employee",
+        use_cache=False,
+    )
+    print(f"Role={sample['role']} | Mode={sample['compression_mode']} | Tokens={sample['used_context_tokens']}/{sample['total_planned_tokens']}")
+    print("Telemetry:", sample["telemetry"])
+    print("Answer:\n", sample["answer"])
