@@ -23,6 +23,8 @@ MAX_TOTAL_TOKENS = MAX_CONTEXT_TOKENS + MAX_FRAMING_TOKENS + MAX_GENERATION_TOKE
 
 VALID_ROLES = {"employee", "manager", "admin"}
 ROLE_RANK = {"employee": 1, "manager": 2, "admin": 3}
+RESTRICTED_DOC_PREFIXES = ("FIN-", "LDR-", "EXEC-", "PAYROLL-")
+RESTRICTED_CLASSIFICATIONS = {"restricted", "confidential", "secret", "internal-restricted"}
 
 ROLE_SCOPED_CACHE: dict[str, dict[str, Any]] = {}
 
@@ -118,42 +120,121 @@ def count_tokens(text: str) -> int:
     return len(ASSETS.tokenizer.encode(text, add_special_tokens=False))
 
 
-def _role_allowed(doc_role: str | None, user_role: str) -> bool:
-    if not doc_role:
+def _extract_allowed_roles(raw_roles: Any) -> set[str]:
+    """Normalize role metadata from lists, tuples, sets, or delimited strings."""
+    if raw_roles is None:
+        return set()
+
+    items: list[str] = []
+    if isinstance(raw_roles, (list, tuple, set)):
+        for entry in raw_roles:
+            if entry is not None:
+                items.extend(re.split(r"[,;|/]+", str(entry)))
+    elif isinstance(raw_roles, str):
+        cleaned = raw_roles.strip()
+        if cleaned.startswith("[") and cleaned.endswith("]"):
+            try:
+                parsed = json.loads(cleaned.replace("'", '"'))
+                if isinstance(parsed, list):
+                    return _extract_allowed_roles(parsed)
+            except Exception:
+                pass
+        items.extend(re.split(r"[,;|/]+", cleaned))
+    else:
+        items.extend(re.split(r"[,;|/]+", str(raw_roles)))
+
+    normalized: set[str] = set()
+    for token in items:
+        role_tok = token.strip().strip("'\"").lower()
+        if role_tok:
+            normalized.add(role_tok)
+    return normalized
+
+
+def _is_restricted_doc(doc_id: str, sensitivity: str) -> bool:
+    doc_upper = (doc_id or "").strip().upper()
+    sens_lower = (sensitivity or "").strip().lower()
+    if any(doc_upper.startswith(prefix) for prefix in RESTRICTED_DOC_PREFIXES):
         return True
-    u_rank = ROLE_RANK.get(user_role.lower(), 1)
-    d_str = str(doc_role).lower().strip()
-    if d_str in ROLE_RANK:
-        return u_rank >= ROLE_RANK[d_str]
-    return user_role.lower() in {r.strip() for r in d_str.split(",")}
+    if sens_lower in RESTRICTED_CLASSIFICATIONS:
+        return True
+    return False
+
+
+def _role_allowed(
+    doc_role: Any,
+    user_role: str,
+    doc_id: str = "",
+    sensitivity: str = "",
+) -> bool:
+    u_role = user_role.lower().strip()
+    if u_role not in VALID_ROLES:
+        return False
+
+    allowed_set = _extract_allowed_roles(doc_role)
+
+    # Explicit role allowlist takes strict precedence
+    if allowed_set:
+        if u_role in allowed_set:
+            return True
+        # Support hierarchical rank only if explicitly specified as a single rank role
+        if len(allowed_set) == 1:
+            only_role = next(iter(allowed_set))
+            if only_role in ROLE_RANK:
+                return ROLE_RANK[u_role] >= ROLE_RANK[only_role]
+        return False
+
+    # Fail closed on known restricted documents or restricted sensitivity tags
+    if _is_restricted_doc(doc_id, sensitivity):
+        return u_role == "admin"
+
+    # Unlabeled non-restricted chunks default to allowed for authenticated internal roles
+    return True
 
 
 def _normalize_record(raw: dict[str, Any], idx: int, score: float = 0.0, source: str = "hybrid") -> dict[str, Any]:
-    meta = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else raw
-    text = raw.get("text") or raw.get("page_content") or raw.get("content") or ""
+    meta = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    text = raw.get("text") or raw.get("page_content") or raw.get("content") or meta.get("text") or ""
     chunk_id = str(raw.get("chunk_id") or meta.get("chunk_id") or raw.get("id") or f"chk_{idx}")
-    doc_id = str(raw.get("doc_id") or meta.get("doc_id") or meta.get("source_doc") or "DOC")
-    section = str(raw.get("section") or meta.get("section") or meta.get("page_label") or "General")
-    allowed_role = meta.get("role") or meta.get("access_role") or meta.get("rbac_role") or raw.get("role")
+    doc_id = str(raw.get("doc_id") or meta.get("doc_id") or meta.get("source_doc") or meta.get("document_id") or "DOC")
+    section = str(raw.get("section") or meta.get("section") or meta.get("page_label") or meta.get("page") or "General")
+    sensitivity = str(raw.get("sensitivity") or meta.get("sensitivity") or meta.get("access_level") or meta.get("classification") or "")
+
+    raw_role_val = None
+    for key in ("allowed_roles", "roles", "role", "access_role", "rbac_role"):
+        if raw.get(key) is not None:
+            raw_role_val = raw.get(key)
+            break
+        if meta.get(key) is not None:
+            raw_role_val = meta.get(key)
+            break
+
     return {
         "chunk_id": chunk_id,
         "doc_id": doc_id,
         "section": section,
-        "allowed_role": allowed_role,
-        "text": text.strip(),
+        "sensitivity": sensitivity,
+        "allowed_role": raw_role_val,
+        "text": str(text).strip(),
         "score": float(score),
         "retrieval_source": source,
         "initial_citation_tag": f"[{chunk_id} | {doc_id} | {section}]",
     }
 
 
-def hybrid_search(query: str, role: str, top_k: int = 8, candidate_k: int = 8) -> list[dict[str, Any]]:
+def hybrid_search_with_audit(
+    query: str,
+    role: str,
+    top_k: int = 8,
+    candidate_k: int = 8,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     ASSETS.ensure_loaded()
     if role not in VALID_ROLES:
         raise ValueError(f"Invalid role '{role}'. Expected one of {sorted(VALID_ROLES)}.")
 
     rrf_scores: dict[str, float] = {}
     records_by_id: dict[str, dict[str, Any]] = {}
+    denied_by_id: dict[str, dict[str, Any]] = {}
     rrf_k = 60.0
 
     # 1. Dense Qdrant search
@@ -170,7 +251,16 @@ def hybrid_search(query: str, role: str, top_k: int = 8, candidate_k: int = 8) -
         for pt in points:
             payload = dict(pt.payload or {})
             rec = _normalize_record(payload, idx=rank, score=float(getattr(pt, "score", 0.0)), source="dense")
-            if not rec["text"] or not _role_allowed(rec["allowed_role"], role):
+            if not rec["text"]:
+                continue
+            if not _role_allowed(rec["allowed_role"], role, doc_id=rec["doc_id"], sensitivity=rec["sensitivity"]):
+                denied_by_id[rec["chunk_id"]] = {
+                    "chunk_id": rec["chunk_id"],
+                    "doc_id": rec["doc_id"],
+                    "section": rec["section"],
+                    "source": "dense",
+                    "reason": "role_not_authorized",
+                }
                 continue
             rank += 1
             cid = rec["chunk_id"]
@@ -193,7 +283,16 @@ def hybrid_search(query: str, role: str, top_k: int = 8, candidate_k: int = 8) -
         for idx in ranked_indices:
             raw_item = corpus_docs[idx] if isinstance(corpus_docs[idx], dict) else {"text": str(corpus_docs[idx]), "chunk_id": f"bm25_{idx}"}
             rec = _normalize_record(raw_item, idx=idx, score=float(scores[idx]), source="bm25")
-            if not rec["text"] or not _role_allowed(rec["allowed_role"], role):
+            if not rec["text"]:
+                continue
+            if not _role_allowed(rec["allowed_role"], role, doc_id=rec["doc_id"], sensitivity=rec["sensitivity"]):
+                denied_by_id[rec["chunk_id"]] = {
+                    "chunk_id": rec["chunk_id"],
+                    "doc_id": rec["doc_id"],
+                    "section": rec["section"],
+                    "source": "bm25",
+                    "reason": "role_not_authorized",
+                }
                 continue
             rank += 1
             cid = rec["chunk_id"]
@@ -206,7 +305,12 @@ def hybrid_search(query: str, role: str, top_k: int = 8, candidate_k: int = 8) -
         item = dict(records_by_id[cid])
         item["rrf_score"] = r_score
         merged.append(item)
-    return merged
+    return merged, list(denied_by_id.values())
+
+
+def hybrid_search(query: str, role: str, top_k: int = 8, candidate_k: int = 8) -> list[dict[str, Any]]:
+    allowed_hits, _ = hybrid_search_with_audit(query=query, role=role, top_k=top_k, candidate_k=candidate_k)
+    return allowed_hits
 
 
 def deduplicate_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -277,9 +381,12 @@ def build_adaptive_context(
     max_framing_tokens: int = CONFIG.max_framing_tokens,
     max_generation_tokens: int = CONFIG.max_generation_tokens,
     max_sentences: int = CONFIG.max_sentences,
+    precomputed_hits: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     ASSETS.ensure_loaded()
-    raw_hits = hybrid_search(query, role=role, top_k=candidate_k, candidate_k=candidate_k)
+    raw_hits = precomputed_hits if precomputed_hits is not None else hybrid_search(
+        query, role=role, top_k=candidate_k, candidate_k=candidate_k
+    )
     deduped = deduplicate_hits(raw_hits)
 
     rescored: list[dict[str, Any]] = []
@@ -486,7 +593,9 @@ def run_rag_query(
         return cached
 
     t0 = time.perf_counter()
-    raw_hits = hybrid_search(query, role=role, top_k=CONFIG.candidate_k, candidate_k=CONFIG.candidate_k)
+    raw_hits, denied_hits = hybrid_search_with_audit(
+        query, role=role, top_k=CONFIG.candidate_k, candidate_k=CONFIG.candidate_k
+    )
     deduped = deduplicate_hits(raw_hits)
     rescored: list[dict[str, Any]] = []
     if deduped:
@@ -511,6 +620,7 @@ def run_rag_query(
         max_framing_tokens=CONFIG.max_framing_tokens,
         max_generation_tokens=CONFIG.max_generation_tokens,
         max_sentences=CONFIG.max_sentences,
+        precomputed_hits=hq_pool,
     )
     t_pack = (time.perf_counter() - t1) * 1000.0
 
@@ -531,6 +641,39 @@ def run_rag_query(
         }
         return cached
 
+    if not ctx_bundle["packed_chunks"]:
+        denied_docs = sorted({d["doc_id"] for d in denied_hits if d.get("doc_id")})
+        refusal_msg = (
+            f"Access denied or no authorized documents found for role '{role}' on this query."
+            + (f" Restricted documents blocked: {', '.join(denied_docs)}." if denied_docs else "")
+        )
+        total_ms = (time.perf_counter() - t_start) * 1000.0
+        result: dict[str, Any] = {
+            "role": role,
+            "query": query,
+            "cache_hit": False,
+            "access_denied": bool(denied_hits),
+            "denied_sources": denied_hits,
+            "compression_mode": ctx_bundle["compression_mode"],
+            "used_context_tokens": 0,
+            "max_context_tokens": ctx_bundle["max_context_tokens"],
+            "max_generation_tokens": ctx_bundle["max_generation_tokens"],
+            "total_planned_tokens": ctx_bundle["max_framing_tokens"] + ctx_bundle["max_generation_tokens"],
+            "active_citations": [],
+            "pruned_chunks": ctx_bundle["pruned_chunks"],
+            "answer": refusal_msg,
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "telemetry": {
+                "retrieval_rerank_ms": round(t_retrieval_rerank, 2),
+                "context_pack_ms": round(t_pack, 2),
+                "llm_ms": 0.0,
+                "total_ms": round(total_ms, 2),
+            },
+        }
+        if use_cache:
+            ROLE_SCOPED_CACHE[cache_key] = dict(result)
+        return result
+
     t2 = time.perf_counter()
     valid_ids = {c["cite_id"] for c in ctx_bundle["packed_chunks"]}
     system_prompt = (
@@ -548,10 +691,12 @@ def run_rag_query(
     t_llm = (time.perf_counter() - t2) * 1000.0
     total_ms = (time.perf_counter() - t_start) * 1000.0
 
-    result: dict[str, Any] = {
+    result = {
         "role": role,
         "query": query,
         "cache_hit": False,
+        "access_denied": bool(denied_hits),
+        "denied_sources": denied_hits,
         "compression_mode": ctx_bundle["compression_mode"],
         "used_context_tokens": ctx_bundle["used_context_tokens"],
         "max_context_tokens": ctx_bundle["max_context_tokens"],
